@@ -25,6 +25,15 @@ _default_origins = [
     "http://localhost:5173",
     "http://localhost:8082",
     "http://localhost:8080",
+    # Common 127.0.0.1 aliases for local dev
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:8082",
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:8001",
+    # Docker/LAN network aliases
+    "http://172.18.0.1:8080",
+    "http://172.20.75.97:8080",
     # Lovable preview URL
     "https://id-preview--3a7b2998-fc47-4b75-9b46-fbfbfd416a18.lovable.app",
 
