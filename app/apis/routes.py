@@ -27,26 +27,26 @@ async def generate_roadmap(profile: UserProfile, db: Session = Depends(get_sessi
             detail=f"Agent Swarm Failure: {str(e)}"
         )
 
-@router.post("/conversations", status_code=status.HTTP_201_CREATED)
-def start_conversation(profile: UserProfile, db: Session = Depends(get_session)):
-    """Start a conversation linked to a user/roadmap. Returns the saved roadmap id and conversation id."""
+@router.post("/sessions", status_code=status.HTTP_201_CREATED)
+def start_session(profile: UserProfile, db: Session = Depends(get_session)):
+    """Start a learning session linked to a user/roadmap. Returns the saved roadmap id and session id."""
     try:
         workflow = AgentWorkflow(db_session=db)
         result = workflow.generate_learning_path_sync(profile)
         # result is a RoadmapResponse (pydantic) but already saved to DB inside workflow
-        return {"roadmap_id": result.get("roadmap_id"), "conversation_id": result.get("conversation_id")}
+        return {"roadmap_id": result.get("roadmap_id"), "session_id": result.get("conversation_id")}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/conversations/{conversation_id}/messages", status_code=status.HTTP_201_CREATED)
-def post_conversation_message(conversation_id: int, message: dict, db: Session = Depends(get_session)):
-    """Post a message in a conversation; message should include 'sender' and 'text'."""
+@router.post("/sessions/{session_id}/messages", status_code=status.HTTP_201_CREATED)
+def post_session_message(session_id: int, message: dict, db: Session = Depends(get_session)):
+    """Post a message in a session; message should include 'sender' and 'text'."""
     try:
-        # store message in agent logs table or a new conversation_messages table (simpler: AgentLog)
+        # store message in agent logs table or a new session_messages table (simpler: AgentLog)
         # We'll attach the message as an AgentLog with agent_name=sender and action=text
         sender = message.get("sender", "user")
         text = message.get("text", "")
-        log = db_models.AgentLog(roadmap_id=conversation_id, agent_name=sender, action=text, timestamp=datetime.datetime.utcnow().isoformat())
+        log = db_models.AgentLog(roadmap_id=session_id, agent_name=sender, action=text, timestamp=datetime.datetime.utcnow().isoformat())
         db.add(log)
         db.commit()
         db.refresh(log)
@@ -54,13 +54,13 @@ def post_conversation_message(conversation_id: int, message: dict, db: Session =
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/conversations/{conversation_id}/progress", status_code=status.HTTP_201_CREATED)
-def mark_module_progress(conversation_id: int, body: dict, db: Session = Depends(get_session)):
-    """Mark a module as completed for a conversation. Body: {"module_id": int, "status": "completed"} """
+@router.post("/sessions/{session_id}/progress", status_code=status.HTTP_201_CREATED)
+def mark_module_progress(session_id: int, body: dict, db: Session = Depends(get_session)):
+    """Mark a module as completed for a session. Body: {"module_id": int, "status": "completed"} """
     try:
         module_id = body.get("module_id")
         status_val = body.get("status", "completed")
-        prog = db_models.ModuleProgress(roadmap_id=conversation_id, module_id=module_id, status=status_val, completed_at=datetime.datetime.utcnow().isoformat())
+        prog = db_models.ModuleProgress(roadmap_id=session_id, module_id=module_id, status=status_val, completed_at=datetime.datetime.utcnow().isoformat())
         db.add(prog)
         db.commit()
         db.refresh(prog)
@@ -68,14 +68,14 @@ def mark_module_progress(conversation_id: int, body: dict, db: Session = Depends
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/conversations/{conversation_id}/regenerate", response_model=RoadmapResponse)
-def regenerate_roadmap(conversation_id: int, db: Session = Depends(get_session)):
-    """Regenerate a roadmap based on existing conversation progress and original profile."""
+@router.post("/sessions/{session_id}/regenerate", response_model=RoadmapResponse)
+def regenerate_roadmap(session_id: int, db: Session = Depends(get_session)):
+    """Regenerate a roadmap based on existing session progress and original profile."""
     try:
         # load existing roadmap and profile
-        roadmap = db.query(db_models.Roadmap).filter(db_models.Roadmap.id == conversation_id).first()
+        roadmap = db.query(db_models.Roadmap).filter(db_models.Roadmap.id == session_id).first()
         if not roadmap:
-            raise HTTPException(status_code=404, detail="Conversation/Roadmap not found")
+            raise HTTPException(status_code=404, detail="Session/Roadmap not found")
 
         profile_json = roadmap.profile
         if not profile_json:
@@ -86,7 +86,7 @@ def regenerate_roadmap(conversation_id: int, db: Session = Depends(get_session))
         profile = UserProfile(**profile_data)
 
         # collect completed module ids
-        completed = db.query(db_models.ModuleProgress).filter(db_models.ModuleProgress.roadmap_id == conversation_id, db_models.ModuleProgress.status == 'completed').all()
+        completed = db.query(db_models.ModuleProgress).filter(db_models.ModuleProgress.roadmap_id == session_id, db_models.ModuleProgress.status == 'completed').all()
         completed_module_ids = [c.module_id for c in completed]
 
         # pass progress to AgentWorkflow so it can consider already-completed modules
@@ -120,8 +120,8 @@ def regenerate_roadmap(conversation_id: int, db: Session = Depends(get_session))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/health")
-def health_check():
+@router.get("/status")
+def status_check():
     return {"status": "active", "service": "Agentic Learning Backend"}
 
 # Debug endpoint to verify Gemini client initialization (enabled via env var)
