@@ -150,6 +150,9 @@ class AgentWorkflow:
         enriched_modules = []
 
         for idx, module in enumerate(modules):
+            if not isinstance(module, dict):
+                logger.warning(f"_enrich_resources_with_real_links: unexpected module type {type(module)} at index {idx}; skipping.")
+                continue
             module_name = module.get("module_name", "")
             skills = module.get("skills_covered", [])
             resources = module.get("resources", [])
@@ -459,12 +462,20 @@ class AgentWorkflow:
             return []
 
         try:
-            return json.loads(candidate)
+            parsed = json.loads(candidate)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+            print(f"_clean_json: unexpected JSON type {type(parsed)}; expected dict or list. Returning empty list.")
+            return []
         except json.JSONDecodeError:
             inner = self._extract_json_substring(candidate)
             if inner:
                 try:
-                    return json.loads(inner)
+                    inner_parsed = json.loads(inner)
+                    if isinstance(inner_parsed, (dict, list)):
+                        return inner_parsed
+                    print(f"_clean_json: unexpected inner JSON type {type(inner_parsed)}; expected dict or list. Returning empty list.")
+                    return []
                 except json.JSONDecodeError:
                     pass
             print(f"Failed to parse JSON: {candidate[:300]}")
