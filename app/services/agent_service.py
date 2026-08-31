@@ -14,12 +14,15 @@ from app.services.youtube_service import YouTubeSearchService, SerperSearchServi
 load_dotenv()
 logger = logging.getLogger("uvicorn.error")
 
-API_KEY = os.getenv("GEMINI_API_KEY")
-if API_KEY:
-    API_KEY = API_KEY.strip().strip('"').strip("'")
+# NVIDIA NIM API configuration
+NVIDIA_API_KEY = os.getenv("NVIDIA_NIM_API") or os.getenv("NVIDIA_API_KEY")
+if NVIDIA_API_KEY:
+    NVIDIA_API_KEY = NVIDIA_API_KEY.strip().strip('"').strip("'")
 
-_genai = None
-_genai_model = None
+NVIDIA_BASE_URL = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
+
+_openai_client = None
 
 try:
     from app.db import models as db_models
@@ -46,48 +49,58 @@ class AgentWorkflow:
         else:
             logger.warning("No YouTube or Serper API key configured - will use LLM-generated links")
 
-    def _ensure_model(self):
-        """Lazily import and configure the google.generativeai client and model."""
-        global _genai, _genai_model, API_KEY
-        if _genai_model is not None:
+    def _ensure_client(self):
+        """Lazily import and configure the OpenAI-compatible client for NVIDIA NIM."""
+        global _openai_client, NVIDIA_API_KEY
+        if _openai_client is not None:
             return
-        if not API_KEY:
-            API_KEY = os.getenv("GEMINI_API_KEY")
-            if API_KEY:
-                API_KEY = API_KEY.strip().strip('"').strip("'")
-        if not API_KEY:
-            logger.warning("GEMINI_API_KEY missing at model initialization time")
+        if not NVIDIA_API_KEY:
+            NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+            if NVIDIA_API_KEY:
+                NVIDIA_API_KEY = NVIDIA_API_KEY.strip().strip('"').strip("'")
+        if not NVIDIA_API_KEY:
+            logger.warning("NVIDIA_API_KEY missing at client initialization time")
             raise RuntimeError(
-                "Gemini API key is not configured. Set GEMINI_API_KEY in your environment or .env before calling generation endpoints.")
+                "NVIDIA API key is not configured. Set NVIDIA_API_KEY in your environment or .env before calling generation endpoints.")
         try:
-            masked = (API_KEY[:4] + "...." + API_KEY[-4:]) if len(API_KEY) > 8 else "****"
-            logger.info(f"Initializing Gemini client with key (masked): {masked}")
+            masked = (NVIDIA_API_KEY[:4] + "...." + NVIDIA_API_KEY[-4:]) if len(NVIDIA_API_KEY) > 8 else "****"
+            logger.info(f"Initializing NVIDIA NIM client with key (masked): {masked}")
+            logger.info(f"Using base URL: {NVIDIA_BASE_URL}")
+            logger.info(f"Using model: {NVIDIA_MODEL}")
 
-            import google.generativeai as genai
-            _genai = genai
-            _genai.configure(api_key=API_KEY)
-            _genai_model = _genai.GenerativeModel("gemini-2.5-flash")
-            logger.info("Gemini client initialized successfully")
+            from openai import OpenAI
+            _openai_client = OpenAI(
+                base_url=NVIDIA_BASE_URL,
+                api_key=NVIDIA_API_KEY,
+                timeout=120.0
+            )
+            logger.info("NVIDIA NIM client initialized successfully")
         except Exception as e:
-            logger.exception("Failed to initialize Gemini client")
-            raise RuntimeError(f"Failed to initialize Gemini client: {e}")
+            logger.exception("Failed to initialize NVIDIA NIM client")
+            raise RuntimeError(f"Failed to initialize NVIDIA NIM client: {e}")
 
     def _call_model(self, prompt: str):
-        """Centralized Gemini call wrapper."""
+        """Centralized NVIDIA NIM call wrapper."""
         try:
-            self._ensure_model()
+            self._ensure_client()
         except RuntimeError:
             raise
         try:
-            resp = _genai_model.generate_content(prompt)
+            resp = _openai_client.chat.completions.create(
+                model=NVIDIA_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=4096,
+                temperature=0.7,
+                top_p=0.9
+            )
             return resp
         except Exception as e:
             msg = str(e)
-            logger.exception("Gemini API call failed")
-            if "API key" in msg or "API_KEY" in msg or "invalid" in msg.lower():
+            logger.exception("NVIDIA NIM API call failed")
+            if "API key" in msg or "API_KEY" in msg or "invalid" in msg.lower() or "unauthorized" in msg.lower():
                 raise RuntimeError(
-                    "Gemini API error: invalid or missing GEMINI_API_KEY. Rotate the key and set GEMINI_API_KEY in your .env or environment variables.")
-            raise RuntimeError(f"Gemini API request failed: {msg}")
+                    "NVIDIA API error: invalid or missing NVIDIA_API_KEY. Check your key in .env or environment variables.")
+            raise RuntimeError(f"NVIDIA NIM API request failed: {msg}")
 
     def _log(self, agent: str, action: str):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -202,10 +215,17 @@ class AgentWorkflow:
         if completed_module_ids:
             progress_note = f"\n\nNOTE: The learner has completed modules with ids: {completed_module_ids}. When creating the updated path, skip or adapt content for those completed modules."
 
+        def _extract_text(response):
+            """Extract text from OpenAI-compatible response."""
+            try:
+                return response.choices[0].message.content
+            except Exception:
+                return str(response)
+
         # --- STEP 1: MARKET ANALYST AGENT ---
         self._log("Market Analyst", f"Scanning job boards for '{profile.target_role}'...")
         market_response = self._call_model(MARKET_ANALYST_PROMPT.format(target_role=profile.target_role))
-        market_data = self._clean_json(getattr(market_response, 'text', str(market_response)))
+        market_data = self._clean_json(_extract_text(market_response))
         self._log("Market Analyst", f"Identified {len(market_data)} critical skills.")
 
         # --- STEP 2: ARCHITECT AGENT ---
@@ -216,7 +236,7 @@ class AgentWorkflow:
             market_trends=json.dumps(market_data)
         ) + progress_note
         architect_response = self._call_model(architect_prompt)
-        structure_data = self._clean_json(getattr(architect_response, 'text', str(architect_response)))
+        structure_data = self._clean_json(_extract_text(architect_response))
         self._log("Architect", f"Created {len(structure_data)} modules.")
 
         # --- STEP 3: CURATOR AGENT (with LLM for structure) ---
@@ -229,7 +249,7 @@ class AgentWorkflow:
         )
         curator_prompt = curator_prompt + progress_note
         curator_response = self._call_model(curator_prompt)
-        curated_data = self._clean_json(getattr(curator_response, 'text', str(curator_response)))
+        curated_data = self._clean_json(_extract_text(curator_response))
 
         # --- NEW: ALWAYS enrich with real YouTube videos for ALL modules ---
         self._log("Curator", "Fetching real YouTube videos from YouTube API for all modules...")
@@ -244,7 +264,11 @@ class AgentWorkflow:
         self._log("Critic", "Validating logical flow and prerequisites...")
         critic_prompt = CRITIC_PROMPT.format(curated_path=json.dumps(curated_data)) + progress_note
         critic_response = self._call_model(critic_prompt)
-        final_roadmap = self._clean_json(getattr(critic_response, 'text', str(critic_response)))
+        final_roadmap = self._clean_json(_extract_text(critic_response))
+        # Fallback to curated_data if critic fails to produce valid JSON
+        if not isinstance(final_roadmap, list) or len(final_roadmap) == 0:
+            self._log("Critic", "Critic returned invalid JSON, falling back to curated data.")
+            final_roadmap = curated_data
         self._log("System", "Roadmap generation complete.")
 
         normalized_roadmap = self._normalize_roadmap(final_roadmap)
