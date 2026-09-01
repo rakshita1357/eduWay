@@ -35,7 +35,15 @@ if DATABASE_URL and DATABASE_URL.startswith(("postgres://", "postgresql://")):
 
 if DATABASE_URL:
     try:
-        _engine = create_engine(DATABASE_URL, echo=False, connect_args=connect_args)
+        _engine = create_engine(
+            DATABASE_URL, 
+            echo=False, 
+            connect_args=connect_args,
+            pool_pre_ping=True,       # Verify connections before use
+            pool_recycle=300,         # Recycle connections every 5 minutes
+            pool_size=5,              # Connection pool size
+            max_overflow=10           # Allow extra connections
+        )
         # Try a lightweight connection test (will raise on DNS/connect failures)
         with _engine.connect() as conn:
             pass

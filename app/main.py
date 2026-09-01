@@ -87,6 +87,12 @@ app.add_middleware(
 # Include Routers
 app.include_router(api_router, prefix="/api/v1", tags=["Roadmap Generation"])
 
+# Health check endpoint
+@app.get("/health")
+def health():
+    import datetime
+    return {"status": "healthy", "timestamp": datetime.datetime.utcnow().isoformat()}
+
 # Root endpoint
 @app.get("/")
 def root():

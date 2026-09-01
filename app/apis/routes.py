@@ -34,7 +34,7 @@ def start_session(profile: UserProfile, db: Session = Depends(get_session)):
         workflow = AgentWorkflow(db_session=db)
         result = workflow.generate_learning_path_sync(profile)
         # result is a RoadmapResponse (pydantic) but already saved to DB inside workflow
-        return {"roadmap_id": result.get("roadmap_id"), "session_id": result.get("conversation_id")}
+        return {"roadmap_id": result.get("roadmap_id"), "conversation_id": result.get("conversation_id")}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
