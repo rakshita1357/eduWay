@@ -42,6 +42,7 @@ _default_origins = [
 
     # Render deployed frontend
     "https://edupath-fe-v1.onrender.com",
+    "https://agent-path-forge.onrender.com",
 
     # If you have final deployed frontend, add here:
     "https://your-frontend.lovable.app",
