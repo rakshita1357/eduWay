@@ -24,6 +24,14 @@ NVIDIA_MODEL = os.getenv("NVIDIA_MODEL", "nvidia/nemotron-3-ultra-550b-a55b")
 
 _openai_client = None
 
+# Gemini fallback configuration
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    GEMINI_API_KEY = GEMINI_API_KEY.strip().strip('"').strip("'")
+
+_genai = None
+_genai_model = None
+
 try:
     from app.db import models as db_models
     from sqlalchemy.orm import Session
@@ -79,28 +87,62 @@ class AgentWorkflow:
             logger.exception("Failed to initialize NVIDIA NIM client")
             raise RuntimeError(f"Failed to initialize NVIDIA NIM client: {e}")
 
+    def _ensure_gemini(self):
+        """Lazily import and configure the Google Generative AI client."""
+        global _genai, _genai_model, GEMINI_API_KEY
+        if _genai_model is not None:
+            return
+        if not GEMINI_API_KEY:
+            GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+            if GEMINI_API_KEY:
+                GEMINI_API_KEY = GEMINI_API_KEY.strip().strip('"').strip("'")
+        if not GEMINI_API_KEY:
+            logger.warning("GEMINI_API_KEY missing at client initialization time")
+            raise RuntimeError(
+                "Gemini API key is not configured. Set GEMINI_API_KEY in your environment or .env before calling generation endpoints.")
+        try:
+            masked = (GEMINI_API_KEY[:4] + "...." + GEMINI_API_KEY[-4:]) if len(GEMINI_API_KEY) > 8 else "****"
+            logger.info(f"Initializing Gemini client with key (masked): {masked}")
+
+            import google.generativeai as genai
+            _genai = genai
+            _genai.configure(api_key=GEMINI_API_KEY)
+            _genai_model = _genai.GenerativeModel("google/gemini-2.5-flash-lite")
+            logger.info("Gemini client initialized successfully")
+        except Exception as e:
+            logger.exception("Failed to initialize Gemini client")
+            raise RuntimeError(f"Failed to initialize Gemini client: {e}")
+
     def _call_model(self, prompt: str):
-        """Centralized NVIDIA NIM call wrapper."""
+        """Try NVIDIA NIM first; on auth/quota/404 errors fall back to Gemini."""
+        # --- NVIDIA attempt ---
         try:
             self._ensure_client()
-        except RuntimeError:
-            raise
-        try:
             resp = _openai_client.chat.completions.create(
                 model=NVIDIA_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=4096,
                 temperature=0.7,
-                top_p=0.9
+                top_p=0.9,
             )
             return resp
         except Exception as e:
             msg = str(e)
-            logger.exception("NVIDIA NIM API call failed")
-            if "API key" in msg or "API_KEY" in msg or "invalid" in msg.lower() or "unauthorized" in msg.lower():
-                raise RuntimeError(
-                    "NVIDIA API error: invalid or missing NVIDIA_API_KEY. Check your key in .env or environment variables.")
-            raise RuntimeError(f"NVIDIA NIM API request failed: {msg}")
+            logger.warning(f"NVIDIA NIM call failed, falling back to Gemini: {msg}")
+
+        # --- Gemini fallback ---
+        try:
+            self._ensure_gemini()
+            from google.generativeai.types import GenerationConfig
+            resp = _genai_model.generate_content(
+                prompt,
+                generation_config=GenerationConfig(max_output_tokens=4096),
+                request_options={"timeout": 120},
+            )
+            return resp
+        except Exception as e:
+            logger.exception("Gemini fallback also failed")
+            raise RuntimeError(f"Both NVIDIA and Gemini failed: {e}")
 
     def _log(self, agent: str, action: str):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -145,6 +187,45 @@ class AgentWorkflow:
         except Exception as e:
             logger.error(f"Error fetching YouTube videos: {e}")
             return []
+
+    def _validate_module_list(self, data, step_name):
+        """Ensure data is a list of dicts with required keys."""
+        # If data is a dict that looks like a single module, wrap it in a list
+        if isinstance(data, dict):
+            if "module_name" in data or "title" in data:
+                logger.info(f"{step_name}: wrapped single module dict into list")
+                return [data]
+            # If data is a dict, try to extract a list from common keys
+            for key in ("modules", "roadmap", "learning_path", "data", "items"):
+                if key in data and isinstance(data[key], list):
+                    logger.info(f"{step_name}: extracted module list from key '{key}'")
+                    data = data[key]
+                    break
+            else:
+                # If dict has a single key that is a list, use that
+                list_vals = [v for v in data.values() if isinstance(v, list)]
+                if len(list_vals) == 1:
+                    logger.info(f"{step_name}: extracted module list from sole list value")
+                    data = list_vals[0]
+                else:
+                    logger.warning(f"{step_name}: expected list, got dict with keys {list(data.keys())}")
+                    return []
+        if not isinstance(data, list):
+            logger.warning(f"{step_name}: expected list, got {type(data)}")
+            return []
+        validated = []
+        for idx, item in enumerate(data):
+            if not isinstance(item, dict):
+                logger.warning(f"{step_name}: item {idx} is not a dict ({type(item)}), skipping")
+                continue
+            # Ensure required keys exist
+            if "module_name" not in item and "title" not in item:
+                logger.warning(f"{step_name}: item {idx} missing module_name/title, skipping")
+                continue
+            validated.append(item)
+        if len(validated) != len(data):
+            logger.warning(f"{step_name}: filtered {len(data) - len(validated)} invalid items")
+        return validated
 
     def _enrich_resources_with_real_links(
             self,
@@ -237,6 +318,7 @@ class AgentWorkflow:
         ) + progress_note
         architect_response = self._call_model(architect_prompt)
         structure_data = self._clean_json(_extract_text(architect_response))
+        structure_data = self._validate_module_list(structure_data, "Architect")
         self._log("Architect", f"Created {len(structure_data)} modules.")
 
         # --- STEP 3: CURATOR AGENT (with LLM for structure) ---
@@ -250,6 +332,12 @@ class AgentWorkflow:
         curator_prompt = curator_prompt + progress_note
         curator_response = self._call_model(curator_prompt)
         curated_data = self._clean_json(_extract_text(curator_response))
+        curated_data = self._validate_module_list(curated_data, "Curator")
+
+        # Fallback to architect structure if curator output is empty or length mismatch
+        if not curated_data or len(curated_data) != len(structure_data):
+            self._log("Curator", f"Curator output length mismatch (got {len(curated_data)}, expected {len(structure_data)}), falling back to architect structure.")
+            curated_data = structure_data
 
         # --- NEW: ALWAYS enrich with real YouTube videos for ALL modules ---
         self._log("Curator", "Fetching real YouTube videos from YouTube API for all modules...")
@@ -265,6 +353,7 @@ class AgentWorkflow:
         critic_prompt = CRITIC_PROMPT.format(curated_path=json.dumps(curated_data)) + progress_note
         critic_response = self._call_model(critic_prompt)
         final_roadmap = self._clean_json(_extract_text(critic_response))
+        final_roadmap = self._validate_module_list(final_roadmap, "Critic")
         # Fallback to curated_data if critic fails to produce valid JSON
         if not isinstance(final_roadmap, list) or len(final_roadmap) == 0:
             self._log("Critic", "Critic returned invalid JSON, falling back to curated data.")
