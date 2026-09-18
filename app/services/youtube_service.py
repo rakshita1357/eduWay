@@ -1,9 +1,35 @@
 import os
+import re
 import requests
 from typing import List, Dict, Optional
 import logging
 
 logger = logging.getLogger("uvicorn.error")
+
+
+def _simplify_query_term(text: str, max_words: int = 6) -> str:
+    """
+    LLM-generated module names and skills often come back as full
+    descriptive strings rather than short keywords, e.g.:
+        "TypeScript 5.x: Strict Mode, Generics, Conditional Types,
+         Mapped Types, Type Inference, Utility Types (Pick, Omit, ReturnType)"
+    Joining a couple of those verbatim into a search query produces a wall
+    of text that YouTube's search can't match against real video titles
+    (this was the direct cause of most "No high-quality videos found"
+    warnings). This strips it down to something searchable:
+      - drop anything in parentheses (asides, examples)
+      - keep only the part before the first colon (the "headline" term)
+      - drop a leading "Module N:" prefix if present
+      - cap to max_words words
+    """
+    if not text:
+        return ""
+    cleaned = re.sub(r"^Module\s*\d+\s*[:\-]\s*", "", text.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\([^)]*\)", "", cleaned)
+    if ":" in cleaned:
+        cleaned = cleaned.split(":", 1)[0]
+    words = cleaned.strip().split()
+    return " ".join(words[:max_words]).strip()
 
 
 class YouTubeSearchService:
@@ -172,9 +198,9 @@ class YouTubeSearchService:
             return "Unknown"
 
         try:
-            import re
+            import re as _re
             pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
-            match = re.match(pattern, iso_duration)
+            match = _re.match(pattern, iso_duration)
 
             if not match:
                 return "Unknown"
@@ -216,14 +242,24 @@ class YouTubeSearchService:
         """
         # Create focused search query
         # Priority: specific skills > module name > general role
-        primary_skills = skills[:2] if len(skills) >= 2 else skills
+        primary_skills_raw = skills[:2] if len(skills) >= 2 else skills
+        # Sanitize each skill string down to a short searchable headline —
+        # raw skill strings from the LLM are often full descriptive
+        # paragraphs with parentheticals and colons, which produced
+        # unmatchable queries (see _simplify_query_term docstring).
+        primary_skills = [_simplify_query_term(s) for s in primary_skills_raw]
+        primary_skills = [s for s in primary_skills if s]
+
+        simple_module_name = _simplify_query_term(module_name, max_words=8)
 
         if primary_skills:
             # Focus on specific skills for better results
-            query = f"{' '.join(primary_skills)} tutorial course"
-        else:
+            query = f"{' '.join(primary_skills)} tutorial"
+        elif simple_module_name:
             # Fallback to module name
-            query = f"{module_name} {target_role} tutorial"
+            query = f"{simple_module_name} {target_role} tutorial"
+        else:
+            query = f"{target_role} tutorial"
 
         logger.info(f"Searching YouTube for: '{query}'")
 
@@ -237,14 +273,18 @@ class YouTubeSearchService:
 
         if not videos:
             logger.warning(f"No high-quality videos found for: {query}")
-            # Try a broader search
-            broader_query = f"{module_name} beginner tutorial"
+            # Try a broader search — also uses the simplified module name,
+            # not the raw verbose one, for the same reason as above.
+            broader_name = simple_module_name or module_name
+            broader_query = f"{broader_name} beginner tutorial"
             videos = self.search_videos(broader_query, max_results=count, relevance_language="en")
+            if not videos:
+                logger.warning(f"No videos found on broader search either: {broader_query}")
 
         # Format for response
         enriched = []
         for video in videos[:count]:
-            skill_text = ", ".join(primary_skills) if primary_skills else module_name
+            skill_text = ", ".join(primary_skills) if primary_skills else (simple_module_name or module_name)
             enriched.append({
                 "title": video["title"],
                 "url": video["url"],
@@ -326,11 +366,16 @@ class SerperSearchService:
             count: int = 3
     ) -> List[Dict[str, str]]:
         """Search using Serper with quality filtering"""
-        primary_skills = skills[:2] if len(skills) >= 2 else skills
+        primary_skills_raw = skills[:2] if len(skills) >= 2 else skills
+        primary_skills = [_simplify_query_term(s) for s in primary_skills_raw]
+        primary_skills = [s for s in primary_skills if s]
+        simple_module_name = _simplify_query_term(module_name, max_words=8)
 
         if primary_skills:
             query = f"{' '.join(primary_skills)} tutorial"
+        elif simple_module_name:
+            query = f"{simple_module_name} {target_role} tutorial"
         else:
-            query = f"{module_name} {target_role} tutorial"
+            query = f"{target_role} tutorial"
 
         return self.search_videos(query, max_results=count)

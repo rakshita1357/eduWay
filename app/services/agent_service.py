@@ -424,7 +424,23 @@ class AgentWorkflow:
             modules=json.dumps(structure_data)
         )
         curator_prompt = curator_prompt + progress_note
-        curator_response = self._call_model(curator_prompt)
+        # Explicit count constraint, independent of whatever CURATOR_PROMPT
+        # itself says — models were non-compliant here (returning 1 module
+        # instead of N) even before the token-budget fix below, so this is
+        # a belt-and-suspenders addition, not a replacement for it.
+        curator_prompt += (
+            f"\n\nIMPORTANT: Your response MUST contain exactly "
+            f"{len(structure_data)} module objects — one for every module "
+            f"listed in the input. Do not omit, merge, or drop any module."
+        )
+        # Curator has to emit a full JSON structure for every module,
+        # including resource-stub objects — genuinely large output. Left at
+        # the 4096 default this was truncating exactly like the old Critic
+        # bug: _clean_json grabs the first complete module, gets wrapped
+        # into a 1-item list, length-mismatch fallback kicks in and uses
+        # bare Architect structure (which has NO resources field at all).
+        # That's the direct cause of modules showing 0 resources.
+        curator_response = self._call_model(curator_prompt, max_tokens=8192)
         curated_data = self._clean_json(_extract_text(curator_response))
         curated_data = self._validate_module_list(curated_data, "Curator")
 
@@ -455,6 +471,15 @@ class AgentWorkflow:
         # NVIDIA request timeout you just hit.
         light_modules = self._strip_resources_for_critic(curated_data)
         critic_prompt = CRITIC_PROMPT.format(curated_path=json.dumps(light_modules)) + progress_note
+        # Critic was still returning only 1 module even after resources
+        # were stripped from its payload (so this wasn't a token-budget
+        # issue) — add the same explicit count constraint as Curator.
+        critic_prompt += (
+            f"\n\nIMPORTANT: Your response MUST contain exactly "
+            f"{len(light_modules)} module objects — one for every module "
+            f"listed above, in the same set. Do not omit, merge, or drop "
+            f"any module."
+        )
         critic_response = self._call_model(critic_prompt, max_tokens=4096)
         critic_modules = self._clean_json(_extract_text(critic_response))
         critic_modules = self._validate_module_list(critic_modules, "Critic")
