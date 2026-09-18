@@ -2,8 +2,10 @@ import os
 import json
 import datetime
 import re
+import time
 from dotenv import load_dotenv
 from typing import Optional, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.models.schemas import UserProfile, RoadmapResponse, AgentLog as AgentLogSchema
 from app.utils.prompts import MARKET_ANALYST_PROMPT, ARCHITECT_PROMPT, CURATOR_PROMPT, CRITIC_PROMPT
 import logging
@@ -80,7 +82,7 @@ class AgentWorkflow:
             _openai_client = OpenAI(
                 base_url=NVIDIA_BASE_URL,
                 api_key=NVIDIA_API_KEY,
-                timeout=120.0
+                timeout=180.0
             )
             logger.info("NVIDIA NIM client initialized successfully")
         except Exception as e:
@@ -107,41 +109,59 @@ class AgentWorkflow:
             import google.generativeai as genai
             _genai = genai
             _genai.configure(api_key=GEMINI_API_KEY)
-            _genai_model = _genai.GenerativeModel("google/gemini-2.5-flash-lite")
+            # NOTE: the google-generativeai SDK wants a bare model name (or
+            # "models/<name>"), NOT an OpenRouter-style "google/<name>"
+            # prefix. The old value caused every fallback call to throw
+            # InvalidArgument immediately, meaning NVIDIA timeouts had no
+            # working fallback at all.
+            _genai_model = _genai.GenerativeModel("gemini-2.5-flash-lite")
             logger.info("Gemini client initialized successfully")
         except Exception as e:
             logger.exception("Failed to initialize Gemini client")
             raise RuntimeError(f"Failed to initialize Gemini client: {e}")
 
-    def _call_model(self, prompt: str):
-        """Try NVIDIA NIM first; on auth/quota/404 errors fall back to Gemini."""
+    def _call_model(self, prompt: str, max_tokens: int = 4096):
+        """Try NVIDIA NIM first; on auth/quota/404 errors fall back to Gemini.
+
+        max_tokens is now configurable per-call so steps that need to echo
+        back large payloads can request more headroom instead of silently
+        truncating at the old hardcoded 4096 limit.
+
+        Also logs wall-clock time for each attempt so slow steps are
+        visible in the server log instead of having to guess where time
+        went.
+        """
         # --- NVIDIA attempt ---
+        t0 = time.time()
         try:
             self._ensure_client()
             resp = _openai_client.chat.completions.create(
                 model=NVIDIA_MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=4096,
+                max_tokens=max_tokens,
                 temperature=0.7,
                 top_p=0.9,
             )
+            logger.info(f"[TIMING] NVIDIA call took {time.time() - t0:.1f}s")
             return resp
         except Exception as e:
             msg = str(e)
-            logger.warning(f"NVIDIA NIM call failed, falling back to Gemini: {msg}")
+            logger.warning(f"[TIMING] NVIDIA call failed after {time.time() - t0:.1f}s, falling back to Gemini: {msg}")
 
         # --- Gemini fallback ---
+        t1 = time.time()
         try:
             self._ensure_gemini()
             from google.generativeai.types import GenerationConfig
             resp = _genai_model.generate_content(
                 prompt,
-                generation_config=GenerationConfig(max_output_tokens=4096),
+                generation_config=GenerationConfig(max_output_tokens=max_tokens),
                 request_options={"timeout": 120},
             )
+            logger.info(f"[TIMING] Gemini fallback call took {time.time() - t1:.1f}s")
             return resp
         except Exception as e:
-            logger.exception("Gemini fallback also failed")
+            logger.exception(f"Gemini fallback also failed after {time.time() - t1:.1f}s")
             raise RuntimeError(f"Both NVIDIA and Gemini failed: {e}")
 
     def _log(self, agent: str, action: str):
@@ -187,6 +207,53 @@ class AgentWorkflow:
         except Exception as e:
             logger.error(f"Error fetching YouTube videos: {e}")
             return []
+
+    def _strip_resources_for_critic(self, modules: List[dict]) -> List[dict]:
+        """
+        The Critic's job is to validate module ordering, prerequisites and
+        logical flow — not to re-review every YouTube URL/duration/reason.
+        Sending it the full resource lists (5 modules x ~3 enriched videos
+        each) was the main driver of both the truncation bug and the
+        request timeout: a much bigger prompt in, and the model has to
+        echo most of it back out. Strip resources down to nothing here;
+        _merge_critic_output_with_resources reattaches the real ones after.
+        """
+        light = []
+        for m in modules:
+            if not isinstance(m, dict):
+                continue
+            light.append({
+                "module_name": m.get("module_name") or m.get("title"),
+                "description": m.get("description", ""),
+                "skills_covered": m.get("skills_covered", []),
+                "why_needed": m.get("why_needed", ""),
+                "estimated_time": m.get("estimated_time", ""),
+            })
+        return light
+
+    def _merge_critic_output_with_resources(self, critic_modules: List[dict], curated_data: List[dict]) -> List[dict]:
+        """
+        Reattach each module's real (enriched) resources — stripped out
+        before the Critic call — by matching on module_name against the
+        pre-Critic curated_data. Preserves whatever ordering/edits the
+        Critic made to the light module list.
+        """
+        by_name = {}
+        for m in curated_data:
+            if isinstance(m, dict):
+                name = m.get("module_name") or m.get("title")
+                if name:
+                    by_name[name] = m
+
+        merged = []
+        for cm in critic_modules:
+            if not isinstance(cm, dict):
+                continue
+            name = cm.get("module_name") or cm.get("title")
+            original = by_name.get(name)
+            resources = original.get("resources", []) if original else []
+            merged.append({**cm, "resources": resources})
+        return merged
 
     def _validate_module_list(self, data, step_name):
         """Ensure data is a list of dicts with required keys."""
@@ -236,17 +303,36 @@ class AgentWorkflow:
         """
         Replace ALL dummy/LLM-generated links with real YouTube videos.
         Fetches high-quality videos for every module.
+
+        Runs the per-module YouTube/Serper lookups concurrently via a
+        thread pool instead of a sequential for-loop, since
+        _fetch_real_youtube_videos is a blocking/sync network call.
+        This is the main latency win: 5 sequential lookups (~2-3 min)
+        collapse to roughly the time of the single slowest lookup.
         """
         if not self.youtube_service:
             logger.warning("YouTube service not configured - keeping LLM-generated links")
             return modules
 
-        enriched_modules = []
+        def _determine_video_count(resources):
+            video_resources = [r for r in resources if r.get("type", "").lower() == "video"]
+            if preferred_style == "Video":
+                # User prefers videos - fetch more
+                return max(3, len(video_resources))
+            elif video_resources:
+                # LLM suggested videos - respect the count
+                return len(video_resources)
+            else:
+                # No videos suggested but we can add some anyway
+                return 2
 
-        for idx, module in enumerate(modules):
+        def process_one(idx, module):
             if not isinstance(module, dict):
-                logger.warning(f"_enrich_resources_with_real_links: unexpected module type {type(module)} at index {idx}; skipping.")
-                continue
+                logger.warning(
+                    f"_enrich_resources_with_real_links: unexpected module type {type(module)} at index {idx}; skipping."
+                )
+                return idx, module
+
             module_name = module.get("module_name", "")
             skills = module.get("skills_covered", [])
             resources = module.get("resources", [])
@@ -257,16 +343,7 @@ class AgentWorkflow:
             video_resources = [r for r in resources if r.get("type", "").lower() == "video"]
             other_resources = [r for r in resources if r.get("type", "").lower() != "video"]
 
-            # Determine how many videos to fetch
-            if preferred_style == "Video":
-                # User prefers videos - fetch more
-                video_count = max(3, len(video_resources))
-            elif video_resources:
-                # LLM suggested videos - respect the count
-                video_count = len(video_resources)
-            else:
-                # No videos suggested but we can add some anyway
-                video_count = 2
+            video_count = _determine_video_count(resources)
 
             # ALWAYS fetch real YouTube videos for each module
             real_videos = self._fetch_real_youtube_videos(
@@ -285,9 +362,19 @@ class AgentWorkflow:
                 new_resources = resources
 
             enriched_module = {**module, "resources": new_resources}
-            enriched_modules.append(enriched_module)
+            return idx, enriched_module
 
-        return enriched_modules
+        enriched_modules: List[Optional[dict]] = [None] * len(modules)
+        max_workers = min(8, max(1, len(modules)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(process_one, idx, module) for idx, module in enumerate(modules)]
+            for future in as_completed(futures):
+                idx, result = future.result()
+                enriched_modules[idx] = result
+
+        # Filter out any None slots defensively (shouldn't happen, but keeps
+        # this function's output contract identical to the old version).
+        return [m for m in enriched_modules if m is not None]
 
     async def generate_learning_path(self, profile: UserProfile,
                                      completed_module_ids: Optional[List[int]] = None) -> RoadmapResponse:
@@ -303,13 +390,18 @@ class AgentWorkflow:
             except Exception:
                 return str(response)
 
+        pipeline_start = time.time()
+
         # --- STEP 1: MARKET ANALYST AGENT ---
+        step_t0 = time.time()
         self._log("Market Analyst", f"Scanning job boards for '{profile.target_role}'...")
         market_response = self._call_model(MARKET_ANALYST_PROMPT.format(target_role=profile.target_role))
         market_data = self._clean_json(_extract_text(market_response))
         self._log("Market Analyst", f"Identified {len(market_data)} critical skills.")
+        logger.info(f"[TIMING] Market Analyst step total: {time.time() - step_t0:.1f}s")
 
         # --- STEP 2: ARCHITECT AGENT ---
+        step_t0 = time.time()
         self._log("Architect", "Designing curriculum structure based on gap analysis...")
         architect_prompt = ARCHITECT_PROMPT.format(
             current_skills=profile.current_skills,
@@ -320,8 +412,10 @@ class AgentWorkflow:
         structure_data = self._clean_json(_extract_text(architect_response))
         structure_data = self._validate_module_list(structure_data, "Architect")
         self._log("Architect", f"Created {len(structure_data)} modules.")
+        logger.info(f"[TIMING] Architect step total: {time.time() - step_t0:.1f}s")
 
         # --- STEP 3: CURATOR AGENT (with LLM for structure) ---
+        step_t0 = time.time()
         self._log("Curator", f"Sourcing {profile.preferred_style} resources for modules...")
 
         # Still use LLM to generate resource structure, but we'll replace video links
@@ -338,8 +432,10 @@ class AgentWorkflow:
         if not curated_data or len(curated_data) != len(structure_data):
             self._log("Curator", f"Curator output length mismatch (got {len(curated_data)}, expected {len(structure_data)}), falling back to architect structure.")
             curated_data = structure_data
+        logger.info(f"[TIMING] Curator LLM call step total: {time.time() - step_t0:.1f}s")
 
-        # --- NEW: ALWAYS enrich with real YouTube videos for ALL modules ---
+        # --- ALWAYS enrich with real YouTube videos for ALL modules ---
+        step_t0 = time.time()
         self._log("Curator", "Fetching real YouTube videos from YouTube API for all modules...")
         curated_data = self._enrich_resources_with_real_links(
             modules=curated_data,
@@ -347,18 +443,36 @@ class AgentWorkflow:
             preferred_style=profile.preferred_style
         )
         self._log("Curator", "Real video links integrated successfully for all modules.")
+        logger.info(f"[TIMING] YouTube enrichment step total: {time.time() - step_t0:.1f}s")
 
         # --- STEP 4: CRITIC AGENT ---
+        step_t0 = time.time()
         self._log("Critic", "Validating logical flow and prerequisites...")
-        critic_prompt = CRITIC_PROMPT.format(curated_path=json.dumps(curated_data)) + progress_note
-        critic_response = self._call_model(critic_prompt)
-        final_roadmap = self._clean_json(_extract_text(critic_response))
-        final_roadmap = self._validate_module_list(final_roadmap, "Critic")
-        # Fallback to curated_data if critic fails to produce valid JSON
-        if not isinstance(final_roadmap, list) or len(final_roadmap) == 0:
-            self._log("Critic", "Critic returned invalid JSON, falling back to curated data.")
+        # Strip resources before sending to the Critic — it only needs to
+        # judge ordering/prerequisites, not re-review every video URL.
+        # This keeps the prompt AND required output small, which is what
+        # was causing both the truncation (silent 1-module bug) and the
+        # NVIDIA request timeout you just hit.
+        light_modules = self._strip_resources_for_critic(curated_data)
+        critic_prompt = CRITIC_PROMPT.format(curated_path=json.dumps(light_modules)) + progress_note
+        critic_response = self._call_model(critic_prompt, max_tokens=4096)
+        critic_modules = self._clean_json(_extract_text(critic_response))
+        critic_modules = self._validate_module_list(critic_modules, "Critic")
+
+        if not isinstance(critic_modules, list) or len(critic_modules) != len(curated_data):
+            self._log(
+                "Critic",
+                f"Critic output invalid or length mismatch (got "
+                f"{len(critic_modules) if isinstance(critic_modules, list) else 'N/A'}, "
+                f"expected {len(curated_data)}), falling back to curated data."
+            )
             final_roadmap = curated_data
+        else:
+            final_roadmap = self._merge_critic_output_with_resources(critic_modules, curated_data)
+        logger.info(f"[TIMING] Critic step total: {time.time() - step_t0:.1f}s")
+
         self._log("System", "Roadmap generation complete.")
+        logger.info(f"[TIMING] Full pipeline total: {time.time() - pipeline_start:.1f}s")
 
         normalized_roadmap = self._normalize_roadmap(final_roadmap)
 
