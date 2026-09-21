@@ -13,15 +13,19 @@ class Roadmap(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id")
     target_role: str
-    market_analysis: str  # store JSON as text
-    profile: Optional[str] = None  # store original UserProfile JSON
+    market_analysis: str
+    profile: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
+
+    # NEW — populated only for resume/JD-driven roadmaps
+    resume_text: Optional[str] = None
+    jd_text: Optional[str] = None
+    jd_source_url: Optional[str] = None
+    gap_analysis: Optional[str] = None  # JSON text
 
     modules: List["Module"] = Relationship(back_populates="roadmap")
     logs: List["AgentLog"] = Relationship(back_populates="roadmap")
     progress: List["ModuleProgress"] = Relationship(back_populates="roadmap")
-
-    # Add the reverse relationship to User so back_populates matches
     user: Optional[User] = Relationship(back_populates="roadmaps")
 
 class Module(SQLModel, table=True):

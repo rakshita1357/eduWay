@@ -6,8 +6,15 @@ import time
 from dotenv import load_dotenv
 from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from app.models.schemas import UserProfile, RoadmapResponse, AgentLog as AgentLogSchema
-from app.utils.prompts import MARKET_ANALYST_PROMPT, ARCHITECT_PROMPT, CURATOR_PROMPT, CRITIC_PROMPT
+from app.models.schemas import UserProfile, RoadmapResponse, AgentLog as AgentLogSchema, GapAnalysis
+from app.utils.prompts import (
+    MARKET_ANALYST_PROMPT,
+    ARCHITECT_PROMPT,
+    CURATOR_PROMPT,
+    CRITIC_PROMPT,
+    GAP_ANALYST_PROMPT,
+    ARCHITECT_FROM_GAP_PROMPT,
+)
 import logging
 
 # Import the YouTube search service
@@ -376,6 +383,9 @@ class AgentWorkflow:
         # this function's output contract identical to the old version).
         return [m for m in enriched_modules if m is not None]
 
+    # ------------------------------------------------------------------
+    # EXISTING FLOW: manual UserProfile -> Market Analyst -> Architect -> ...
+    # ------------------------------------------------------------------
     async def generate_learning_path(self, profile: UserProfile,
                                      completed_module_ids: Optional[List[int]] = None) -> RoadmapResponse:
 
@@ -509,7 +519,8 @@ class AgentWorkflow:
         return RoadmapResponse(
             market_analysis=market_data,
             roadmap=normalized_roadmap,
-            agent_logs=self.logs
+            agent_logs=self.logs,
+            roadmap_id=self._current_roadmap_id,
         )
 
     def generate_learning_path_sync(self, profile: UserProfile,
@@ -575,6 +586,261 @@ class AgentWorkflow:
                 agent_name=log.agent_name,
                 action=log.action,
                 timestamp=log.timestamp
+            )
+            self.db.add(log_row)
+        self.db.commit()
+
+        self._current_roadmap_id = roadmap_row.id
+        return {"roadmap_id": roadmap_row.id}
+
+    # ------------------------------------------------------------------
+    # NEW FLOW: Resume + Job Description -> Gap Analyst -> Architect -> ...
+    # ------------------------------------------------------------------
+    async def generate_roadmap_from_gap_analysis(
+        self,
+        name: str,
+        target_role: str,
+        preferred_style: str,
+        resume_text: str,
+        jd_text: str,
+        jd_source_url: Optional[str] = None,
+        completed_module_ids: Optional[List[int]] = None,
+    ) -> RoadmapResponse:
+        """
+        Resume/JD-driven variant of generate_learning_path. Steps 2-4
+        (Curator -> YouTube enrichment -> Critic) are identical to the
+        manual flow; only skill-gap discovery (Gap Analyst) and curriculum
+        design (Architect, gap-driven prompt) differ.
+        """
+
+        progress_note = ""
+        if completed_module_ids:
+            progress_note = (
+                f"\n\nNOTE: The learner has completed modules with ids: "
+                f"{completed_module_ids}. Skip or adapt content for those."
+            )
+
+        def _extract_text(response):
+            try:
+                return response.choices[0].message.content
+            except Exception:
+                return str(response)
+
+        pipeline_start = time.time()
+
+        # --- STEP 0: GAP ANALYST AGENT ---
+        step_t0 = time.time()
+        self._log("Gap Analyst", "Comparing resume against job description...")
+        gap_prompt = GAP_ANALYST_PROMPT.format(
+            resume_text=resume_text,
+            target_role=target_role,
+            jd_text=jd_text,
+        )
+        gap_response = self._call_model(gap_prompt, max_tokens=4096)
+        gap_data = self._clean_json(_extract_text(gap_response))
+        if not isinstance(gap_data, dict):
+            gap_data = {}
+        gap_data.setdefault("matched_skills", [])
+        gap_data.setdefault("gaps", [])
+        try:
+            gap_analysis = GapAnalysis(**gap_data)
+        except Exception as e:
+            logger.warning(f"Gap Analyst output failed validation, using empty gap analysis: {e}")
+            gap_analysis = GapAnalysis()
+        self._log(
+            "Gap Analyst",
+            f"Found {len(gap_analysis.matched_skills)} matched skills and "
+            f"{len(gap_analysis.gaps)} gaps."
+        )
+        logger.info(f"[TIMING] Gap Analyst step total: {time.time() - step_t0:.1f}s")
+
+        # --- STEP 1: ARCHITECT AGENT (gap-driven) ---
+        step_t0 = time.time()
+        self._log("Architect", "Designing curriculum to close identified gaps...")
+        architect_prompt = ARCHITECT_FROM_GAP_PROMPT.format(
+            target_role=target_role,
+            matched_skills=json.dumps(gap_analysis.matched_skills),
+            gaps=json.dumps([g.dict() for g in gap_analysis.gaps]),
+        ) + progress_note
+        architect_response = self._call_model(architect_prompt)
+        structure_data = self._clean_json(_extract_text(architect_response))
+        structure_data = self._validate_module_list(structure_data, "Architect")
+        self._log("Architect", f"Created {len(structure_data)} modules.")
+        logger.info(f"[TIMING] Architect step total: {time.time() - step_t0:.1f}s")
+
+        # --- STEP 2: CURATOR AGENT (same as manual flow) ---
+        step_t0 = time.time()
+        self._log("Curator", f"Sourcing {preferred_style} resources for modules...")
+        curator_prompt = CURATOR_PROMPT.format(
+            preferred_style=preferred_style,
+            modules=json.dumps(structure_data),
+        ) + progress_note
+        curator_prompt += (
+            f"\n\nIMPORTANT: Your response MUST contain exactly "
+            f"{len(structure_data)} module objects — one for every module "
+            f"listed in the input. Do not omit, merge, or drop any module."
+        )
+        curator_response = self._call_model(curator_prompt, max_tokens=8192)
+        curated_data = self._clean_json(_extract_text(curator_response))
+        curated_data = self._validate_module_list(curated_data, "Curator")
+
+        if not curated_data or len(curated_data) != len(structure_data):
+            self._log("Curator", f"Curator output length mismatch (got {len(curated_data)}, expected {len(structure_data)}), falling back to architect structure.")
+            curated_data = structure_data
+        logger.info(f"[TIMING] Curator LLM call step total: {time.time() - step_t0:.1f}s")
+
+        # --- ALWAYS enrich with real YouTube videos for ALL modules ---
+        step_t0 = time.time()
+        self._log("Curator", "Fetching real YouTube videos from YouTube API for all modules...")
+        curated_data = self._enrich_resources_with_real_links(
+            modules=curated_data,
+            target_role=target_role,
+            preferred_style=preferred_style,
+        )
+        self._log("Curator", "Real video links integrated successfully for all modules.")
+        logger.info(f"[TIMING] YouTube enrichment step total: {time.time() - step_t0:.1f}s")
+
+        # --- STEP 3: CRITIC AGENT (same as manual flow) ---
+        step_t0 = time.time()
+        self._log("Critic", "Validating logical flow and prerequisites...")
+        light_modules = self._strip_resources_for_critic(curated_data)
+        critic_prompt = CRITIC_PROMPT.format(curated_path=json.dumps(light_modules)) + progress_note
+        critic_prompt += (
+            f"\n\nIMPORTANT: Your response MUST contain exactly "
+            f"{len(light_modules)} module objects — one for every module "
+            f"listed above, in the same set. Do not omit, merge, or drop "
+            f"any module."
+        )
+        critic_response = self._call_model(critic_prompt, max_tokens=4096)
+        critic_modules = self._clean_json(_extract_text(critic_response))
+        critic_modules = self._validate_module_list(critic_modules, "Critic")
+
+        if not isinstance(critic_modules, list) or len(critic_modules) != len(curated_data):
+            self._log(
+                "Critic",
+                f"Critic output invalid or length mismatch (got "
+                f"{len(critic_modules) if isinstance(critic_modules, list) else 'N/A'}, "
+                f"expected {len(curated_data)}), falling back to curated data."
+            )
+            final_roadmap = curated_data
+        else:
+            final_roadmap = self._merge_critic_output_with_resources(critic_modules, curated_data)
+        logger.info(f"[TIMING] Critic step total: {time.time() - step_t0:.1f}s")
+
+        self._log("System", "Roadmap generation complete.")
+        logger.info(f"[TIMING] Full pipeline total: {time.time() - pipeline_start:.1f}s")
+
+        normalized_roadmap = self._normalize_roadmap(final_roadmap)
+
+        if self.db and db_models:
+            self._save_gap_roadmap_to_db(
+                name=name,
+                target_role=target_role,
+                preferred_style=preferred_style,
+                resume_text=resume_text,
+                jd_text=jd_text,
+                jd_source_url=jd_source_url,
+                gap_analysis=gap_analysis,
+                roadmap=normalized_roadmap,
+            )
+
+        # Also surface gaps in the market_analysis field (shape-compatible
+        # with MarketTrend) so any existing UI reading that field still
+        # shows something meaningful for gap-based roadmaps.
+        market_analysis_view = [
+            {"skill": g.skill, "demand_level": g.importance, "growth_metric": g.status}
+            for g in gap_analysis.gaps
+        ]
+
+        return RoadmapResponse(
+            market_analysis=market_analysis_view,
+            roadmap=normalized_roadmap,
+            agent_logs=self.logs,
+            gap_analysis=gap_analysis,
+            roadmap_id=self._current_roadmap_id,
+        )
+
+    def generate_roadmap_from_gap_analysis_sync(self, *args, **kwargs) -> dict:
+        """Synchronous wrapper, mirrors generate_learning_path_sync."""
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result: RoadmapResponse = loop.run_until_complete(
+            self.generate_roadmap_from_gap_analysis(*args, **kwargs)
+        )
+        roadmap_id = getattr(self, "_current_roadmap_id", None)
+        return {"roadmap_id": roadmap_id, "conversation_id": roadmap_id, "result": result}
+
+    def _save_gap_roadmap_to_db(
+        self,
+        name: str,
+        target_role: str,
+        preferred_style: str,
+        resume_text: str,
+        jd_text: str,
+        jd_source_url: Optional[str],
+        gap_analysis: GapAnalysis,
+        roadmap: list,
+    ):
+        """Persist a resume/JD-driven roadmap to the database."""
+        if not self.db or not db_models:
+            return {}
+
+        user = db_models.User(name=name)
+        self.db.add(user)
+        self.db.commit()
+        self.db.refresh(user)
+
+        roadmap_row = db_models.Roadmap(
+            user_id=user.id,
+            target_role=target_role,
+            market_analysis=json.dumps([g.dict() for g in gap_analysis.gaps]),
+            profile=json.dumps({
+                "name": name,
+                "target_role": target_role,
+                "preferred_style": preferred_style,
+            }),
+            resume_text=resume_text,
+            jd_text=jd_text,
+            jd_source_url=jd_source_url,
+            gap_analysis=gap_analysis.json(),
+        )
+        self.db.add(roadmap_row)
+        self.db.commit()
+        self.db.refresh(roadmap_row)
+
+        for m in roadmap:
+            module_row = db_models.Module(
+                roadmap_id=roadmap_row.id,
+                module_index=m.get("id", 0),
+                module_name=m.get("module_name", ""),
+                description=m.get("description", ""),
+                skills_covered=json.dumps(m.get("skills_covered", [])),
+                why_needed=m.get("why_needed", ""),
+                estimated_time=m.get("estimated_time", ""),
+            )
+            self.db.add(module_row)
+            self.db.commit()
+            self.db.refresh(module_row)
+
+            for r in m.get("resources", []):
+                resource_row = db_models.Resource(
+                    module_id=module_row.id,
+                    title=r.get("title", ""),
+                    url=r.get("url", ""),
+                    type=r.get("type", "Article"),
+                    duration=r.get("duration", ""),
+                    reason=r.get("reason", ""),
+                )
+                self.db.add(resource_row)
+            self.db.commit()
+
+        for log in self.logs:
+            log_row = db_models.AgentLog(
+                roadmap_id=roadmap_row.id,
+                agent_name=log.agent_name,
+                action=log.action,
+                timestamp=log.timestamp,
             )
             self.db.add(log_row)
         self.db.commit()

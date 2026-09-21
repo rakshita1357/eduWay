@@ -1,7 +1,10 @@
-from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi import APIRouter, HTTPException, status, Depends, UploadFile, File, Form
 from sqlalchemy.orm import Session
+from typing import Optional
 from app.models.schemas import UserProfile, RoadmapResponse
 from app.services.agent_service import AgentWorkflow
+from app.services.document_parser_service import extract_resume_text
+from app.services.job_fetcher_service import fetch_job_description
 from app.db.session import get_session
 from app.db import models as db_models
 import datetime
@@ -27,6 +30,81 @@ async def generate_roadmap(profile: UserProfile, db: Session = Depends(get_sessi
             detail=f"Agent Swarm Failure: {str(e)}"
         )
 
+
+@router.post("/generate-roadmap-from-docs", response_model=RoadmapResponse, status_code=status.HTTP_200_OK)
+async def generate_roadmap_from_docs(
+    name: str = Form(...),
+    target_role: str = Form(...),
+    preferred_style: str = Form("Video"),
+    job_url: Optional[str] = Form(None),
+    jd_text: Optional[str] = Form(None),
+    resume: UploadFile = File(...),
+    db: Session = Depends(get_session),
+):
+    """
+    Resume + Job Description (via URL or pasted text) -> Gap Analyst ->
+    dynamic, gap-driven learning roadmap.
+
+    Exactly one of job_url / jd_text must be usable:
+    - If jd_text is provided, it's used directly (most reliable).
+    - If only job_url is provided, we attempt to fetch and extract the JD
+      from the page. Many job boards render via JS or block scraping, so
+      this can fail — in that case we return a 422 asking the caller to
+      paste the JD text instead, rather than feeding the pipeline garbage.
+    """
+    if not job_url and not jd_text:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Provide either job_url or jd_text.",
+        )
+
+    try:
+        resume_text = await extract_resume_text(resume)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Failed to read resume file: {str(e)}",
+        )
+
+    final_jd_text = jd_text
+    if job_url and not jd_text:
+        fetched = await fetch_job_description(job_url)
+        if not fetched:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "Could not fetch or parse that job URL (the page may "
+                    "require JavaScript or block automated access). "
+                    "Please paste the job description text instead."
+                ),
+            )
+        final_jd_text = fetched
+    elif job_url and jd_text:
+        # Both given — prefer the explicit paste, it's more reliable than scraping.
+        final_jd_text = jd_text
+
+    try:
+        workflow = AgentWorkflow(db_session=db)
+        result = await workflow.generate_roadmap_from_gap_analysis(
+            name=name,
+            target_role=target_role,
+            preferred_style=preferred_style,
+            resume_text=resume_text,
+            jd_text=final_jd_text,
+            jd_source_url=job_url,
+        )
+        return result
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Agent Swarm Failure: {str(e)}",
+        )
+
+
 @router.post("/sessions", status_code=status.HTTP_201_CREATED)
 def start_session(profile: UserProfile, db: Session = Depends(get_session)):
     """Start a learning session linked to a user/roadmap. Returns the saved roadmap id and session id."""
@@ -37,6 +115,7 @@ def start_session(profile: UserProfile, db: Session = Depends(get_session)):
         return {"roadmap_id": result.get("roadmap_id"), "conversation_id": result.get("conversation_id")}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.post("/sessions/{session_id}/messages", status_code=status.HTTP_201_CREATED)
 def post_session_message(session_id: int, message: dict, db: Session = Depends(get_session)):
@@ -54,6 +133,7 @@ def post_session_message(session_id: int, message: dict, db: Session = Depends(g
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.post("/sessions/{session_id}/progress", status_code=status.HTTP_201_CREATED)
 def mark_module_progress(session_id: int, body: dict, db: Session = Depends(get_session)):
     """Mark a module as completed for a session. Body: {"module_id": int, "status": "completed"} """
@@ -68,40 +148,68 @@ def mark_module_progress(session_id: int, body: dict, db: Session = Depends(get_
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.post("/sessions/{session_id}/regenerate", response_model=RoadmapResponse)
 def regenerate_roadmap(session_id: int, db: Session = Depends(get_session)):
-    """Regenerate a roadmap based on existing session progress and original profile."""
+    """
+    Regenerate a roadmap based on existing session progress and original
+    profile. Automatically detects whether the original roadmap was
+    resume/JD-driven (has resume_text stored) or manual-profile-driven,
+    and re-runs the matching pipeline so gap-based roadmaps stay dynamic
+    as modules are completed.
+    """
     try:
-        # load existing roadmap and profile
+        # load existing roadmap
         roadmap = db.query(db_models.Roadmap).filter(db_models.Roadmap.id == session_id).first()
         if not roadmap:
             raise HTTPException(status_code=404, detail="Session/Roadmap not found")
 
-        profile_json = roadmap.profile
-        if not profile_json:
-            raise HTTPException(status_code=400, detail="Original profile not available for regeneration")
-
-        # load profile and progress
-        profile_data = json.loads(profile_json)
-        profile = UserProfile(**profile_data)
-
-        # collect completed module ids
-        completed = db.query(db_models.ModuleProgress).filter(db_models.ModuleProgress.roadmap_id == session_id, db_models.ModuleProgress.status == 'completed').all()
+        # collect completed module ids (shared by both flows)
+        completed = db.query(db_models.ModuleProgress).filter(
+            db_models.ModuleProgress.roadmap_id == session_id,
+            db_models.ModuleProgress.status == 'completed'
+        ).all()
         completed_module_ids = [c.module_id for c in completed]
 
-        # pass progress to AgentWorkflow so it can consider already-completed modules
         workflow = AgentWorkflow(db_session=db)
-        # Pass completed_module_ids into generation so agents get the progress context
-        result = workflow.generate_learning_path_sync(profile, completed_module_ids=completed_module_ids)
-        # result will save a new roadmap and return new ids; load and return the new roadmap response
-        new_roadmap_id = result.get("roadmap_id")
+
+        is_gap_based = bool(getattr(roadmap, "resume_text", None) and getattr(roadmap, "jd_text", None))
+
+        if is_gap_based:
+            profile_data = json.loads(roadmap.profile) if roadmap.profile else {}
+            result_dict = workflow.generate_roadmap_from_gap_analysis_sync(
+                name=profile_data.get("name", "Candidate"),
+                target_role=roadmap.target_role,
+                preferred_style=profile_data.get("preferred_style", "Video"),
+                resume_text=roadmap.resume_text,
+                jd_text=roadmap.jd_text,
+                jd_source_url=roadmap.jd_source_url,
+                completed_module_ids=completed_module_ids,
+            )
+            new_roadmap_id = result_dict.get("roadmap_id")
+        else:
+            profile_json = roadmap.profile
+            if not profile_json:
+                raise HTTPException(status_code=400, detail="Original profile not available for regeneration")
+            profile_data = json.loads(profile_json)
+            profile = UserProfile(**profile_data)
+
+            result = workflow.generate_learning_path_sync(profile, completed_module_ids=completed_module_ids)
+            new_roadmap_id = result.get("roadmap_id")
+
         new_roadmap = db.query(db_models.Roadmap).filter(db_models.Roadmap.id == new_roadmap_id).first()
-        # build a RoadmapResponse from DB
         if not new_roadmap:
             raise HTTPException(status_code=500, detail="Failed to create regenerated roadmap")
 
-        # fetch market_analysis, modules, and logs to assemble response
-        market_analysis = json.loads(new_roadmap.market_analysis)
+        # fetch market_analysis/gap_analysis, modules, and logs to assemble response
+        market_analysis = json.loads(new_roadmap.market_analysis) if new_roadmap.market_analysis else []
+        gap_analysis = None
+        if getattr(new_roadmap, "gap_analysis", None):
+            try:
+                gap_analysis = json.loads(new_roadmap.gap_analysis)
+            except (TypeError, ValueError):
+                gap_analysis = None
+
         modules = []
         for m in db.query(db_models.Module).filter(db_models.Module.roadmap_id == new_roadmap.id).all():
             resources = []
@@ -113,16 +221,24 @@ def regenerate_roadmap(session_id: int, db: Session = Depends(get_session)):
         for l in db.query(db_models.AgentLog).filter(db_models.AgentLog.roadmap_id == new_roadmap.id).all():
             logs.append({"agent_name": l.agent_name, "action": l.action, "timestamp": l.timestamp})
 
-        return RoadmapResponse(market_analysis=market_analysis, roadmap=modules, agent_logs=logs)
+        return RoadmapResponse(
+            market_analysis=market_analysis,
+            roadmap=modules,
+            agent_logs=logs,
+            gap_analysis=gap_analysis,
+            roadmap_id=new_roadmap.id,
+        )
 
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @router.get("/status")
 def status_check():
     return {"status": "active", "service": "Agentic Learning Backend"}
+
 
 # Debug endpoint to verify Gemini client initialization (enabled via env var)
 @router.get("/debug/gen-init")
