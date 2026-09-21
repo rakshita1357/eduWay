@@ -157,7 +157,7 @@ def mark_module_progress(session_id: int, body: dict, db: Session = Depends(get_
     try:
         module_id = body.get("module_id")
         status_val = body.get("status", "completed")
-        prog = db_models.ModuleProgress(roadmap_id=session_id, module_id=module_id, status=status_val, completed_at=datetime.datetime.utcnow().isoformat())
+        prog = db_models.ModuleProgress(roadmap_id=session_id, module_id=module_id, status=status_val, completed_at=datetime.datetime.now(datetime.timezone.utc))
         db.add(prog)
         db.commit()
         db.refresh(prog)
