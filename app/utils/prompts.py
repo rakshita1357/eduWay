@@ -76,3 +76,54 @@ Instructions:
 
 Format: Return the final validated JSON with the same structure as input.
 """
+
+# --- AGENT 0: GAP ANALYST (resume + JD mode) ---
+GAP_ANALYST_PROMPT = """
+Act as a Senior Technical Recruiter and Resume Reviewer.
+Task: Compare the candidate's resume against the target job description and identify skill gaps.
+
+Resume:
+---
+{resume_text}
+---
+
+Job Description (target role: {target_role}):
+---
+{jd_text}
+---
+
+Instructions:
+1. Extract the concrete technical skills, tools, and frameworks explicitly required or strongly implied by the JD.
+2. Extract the concrete technical skills the candidate demonstrably has, based on the resume (projects, experience, listed skills).
+3. Classify each JD-required skill as:
+   - "Met": candidate clearly has it
+   - "Partial": candidate has adjacent/related experience but not the specific skill, or has it at a lower level than the JD implies
+   - "Missing": no evidence in the resume
+4. For each "Missing" or "Partial" skill, set 'importance' to "Critical" (explicitly required, blocking), "High" (strongly implied / repeated in JD), or "Medium" (nice-to-have).
+5. Write a 1-2 sentence 'note' for each gap explaining why it matters for this specific role.
+6. Write a 2-3 sentence 'resume_summary' of the candidate's current profile, and a 2-3 sentence 'jd_summary' of what the role actually demands.
+
+Format: Return ONLY a JSON object with keys:
+'matched_skills' (list of strings),
+'gaps' (list of objects: 'skill', 'status', 'importance', 'note'),
+'resume_summary' (string),
+'jd_summary' (string).
+"""
+
+# --- AGENT 2b: ARCHITECT (gap-driven variant) ---
+ARCHITECT_FROM_GAP_PROMPT = """
+Act as a Curriculum Architect.
+Task: Create a structured learning path that closes the candidate's specific skill gaps for this job.
+
+Target Role: {target_role}
+Candidate's Existing Skills: {matched_skills}
+Skill Gaps (ordered by importance — Critical gaps MUST be addressed first): {gaps}
+
+Instructions:
+1. Prioritize modules that close "Critical" and "High" importance gaps before "Medium" ones.
+2. Do NOT create modules for skills the candidate already has (matched_skills) unless a gap explicitly notes a deeper/updated version is needed.
+3. Structure the path: Create 4-6 sequential modules, scaffolded so earlier modules build toward later ones.
+4. Explainability: For EACH module, write a 'why_needed' explanation that references the SPECIFIC gap it closes and why that gap matters for this job (Feature C).
+
+Format: Return JSON. List of modules. Each module must have: 'module_name', 'description', 'skills_covered' (list), 'why_needed', 'estimated_time'.
+"""
