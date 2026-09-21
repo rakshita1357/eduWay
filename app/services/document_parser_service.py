@@ -1,4 +1,9 @@
-"""Extracts plain text from an uploaded resume (PDF / DOCX / TXT)."""
+"""Extracts plain text from an uploaded document (PDF / DOCX / TXT).
+
+Used for both the resume upload and the new "upload JD as a file"
+option — same file types, same extraction logic, just different size
+limits and error copy depending on which document it is.
+"""
 import io
 import logging
 from fastapi import UploadFile
@@ -6,9 +11,18 @@ from fastapi import UploadFile
 logger = logging.getLogger("uvicorn.error")
 
 MAX_RESUME_CHARS = 15000  # keep prompt payloads sane
+MAX_JD_CHARS = 8000       # JDs are shorter than resumes; matches job_fetcher_service's URL-scrape limit
 
 
 async def extract_resume_text(file: UploadFile) -> str:
+    return await _extract_document_text(file, max_chars=MAX_RESUME_CHARS, label="resume")
+
+
+async def extract_jd_text_from_file(file: UploadFile) -> str:
+    return await _extract_document_text(file, max_chars=MAX_JD_CHARS, label="job description")
+
+
+async def _extract_document_text(file: UploadFile, max_chars: int, label: str) -> str:
     filename = (file.filename or "").lower()
     raw = await file.read()
 
@@ -28,12 +42,12 @@ async def extract_resume_text(file: UploadFile) -> str:
     text = text.strip()
     if not text:
         raise ValueError(
-            "Could not extract any text from the uploaded resume. "
+            f"Could not extract any text from the uploaded {label}. "
             "Please upload a text-based PDF or DOCX (not a scanned image)."
         )
-    if len(text) > MAX_RESUME_CHARS:
-        logger.warning(f"Resume text truncated from {len(text)} to {MAX_RESUME_CHARS} chars")
-        text = text[:MAX_RESUME_CHARS]
+    if len(text) > max_chars:
+        logger.warning(f"{label} text truncated from {len(text)} to {max_chars} chars")
+        text = text[:max_chars]
     return text
 
 

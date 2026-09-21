@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from typing import Optional
 from app.models.schemas import UserProfile, RoadmapResponse
 from app.services.agent_service import AgentWorkflow
-from app.services.document_parser_service import extract_resume_text
+from app.services.document_parser_service import extract_resume_text, extract_jd_text_from_file
 from app.services.job_fetcher_service import fetch_job_description
 from app.db.session import get_session
 from app.db import models as db_models
@@ -39,23 +39,28 @@ async def generate_roadmap_from_docs(
     job_url: Optional[str] = Form(None),
     jd_text: Optional[str] = Form(None),
     resume: UploadFile = File(...),
+    jd_file: Optional[UploadFile] = File(None),
     db: Session = Depends(get_session),
 ):
     """
-    Resume + Job Description (via URL or pasted text) -> Gap Analyst ->
-    dynamic, gap-driven learning roadmap.
+    Resume + Job Description -> Gap Analyst -> dynamic, gap-driven learning
+    roadmap.
 
-    Exactly one of job_url / jd_text must be usable:
-    - If jd_text is provided, it's used directly (most reliable).
-    - If only job_url is provided, we attempt to fetch and extract the JD
-      from the page. Many job boards render via JS or block scraping, so
-      this can fail — in that case we return a 422 asking the caller to
-      paste the JD text instead, rather than feeding the pipeline garbage.
+    The job description can be supplied THREE ways — provide exactly one
+    (if more than one is given, precedence is jd_text > jd_file > job_url,
+    since more direct input is more reliable than something we have to
+    parse or scrape ourselves):
+    - jd_text: pasted job description text (most reliable)
+    - jd_file: an uploaded PDF/DOCX/TXT of the job posting
+    - job_url: a link to the job posting; we attempt to fetch and extract
+      the JD from the page. Many job boards render via JS or block
+      scraping, so this can fail — in that case we return a 422 asking
+      the caller to paste the JD text or upload it as a file instead.
     """
-    if not job_url and not jd_text:
+    if not job_url and not jd_text and not jd_file:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Provide either job_url or jd_text.",
+            detail="Provide a job description via jd_text, jd_file, or job_url.",
         )
 
     try:
@@ -68,8 +73,22 @@ async def generate_roadmap_from_docs(
             detail=f"Failed to read resume file: {str(e)}",
         )
 
-    final_jd_text = jd_text
-    if job_url and not jd_text:
+    final_jd_text: Optional[str] = None
+    jd_source_url: Optional[str] = None
+
+    if jd_text:
+        final_jd_text = jd_text
+    elif jd_file:
+        try:
+            final_jd_text = await extract_jd_text_from_file(jd_file)
+        except ValueError as e:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Failed to read job description file: {str(e)}",
+            )
+    elif job_url:
         fetched = await fetch_job_description(job_url)
         if not fetched:
             raise HTTPException(
@@ -77,13 +96,11 @@ async def generate_roadmap_from_docs(
                 detail=(
                     "Could not fetch or parse that job URL (the page may "
                     "require JavaScript or block automated access). "
-                    "Please paste the job description text instead."
+                    "Please paste the job description text or upload it as a file instead."
                 ),
             )
         final_jd_text = fetched
-    elif job_url and jd_text:
-        # Both given — prefer the explicit paste, it's more reliable than scraping.
-        final_jd_text = jd_text
+        jd_source_url = job_url
 
     try:
         workflow = AgentWorkflow(db_session=db)
@@ -93,7 +110,7 @@ async def generate_roadmap_from_docs(
             preferred_style=preferred_style,
             resume_text=resume_text,
             jd_text=final_jd_text,
-            jd_source_url=job_url,
+            jd_source_url=jd_source_url,
         )
         return result
     except HTTPException:
