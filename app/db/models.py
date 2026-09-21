@@ -1,11 +1,20 @@
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlmodel import SQLModel, Field, Relationship
+
+
+def _utcnow() -> datetime:
+    """Timezone-aware UTC now. psycopg3 rejects naive datetimes when the
+    underlying Postgres column is timestamptz, which is what caused:
+    'Datetime values must have timezone information' in prod. Always use
+    this instead of datetime.utcnow() (which returns a naive datetime)."""
+    return datetime.now(timezone.utc)
+
 
 class User(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_utcnow)
 
     roadmaps: List["Roadmap"] = Relationship(back_populates="user")
 
@@ -13,11 +22,11 @@ class Roadmap(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="user.id")
     target_role: str
-    market_analysis: str
-    profile: Optional[str] = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    market_analysis: str  # store JSON as text
+    profile: Optional[str] = None  # store original UserProfile JSON
+    created_at: datetime = Field(default_factory=_utcnow)
 
-    # NEW — populated only for resume/JD-driven roadmaps
+    # Populated only for resume/JD-driven roadmaps (gap-analysis flow)
     resume_text: Optional[str] = None
     jd_text: Optional[str] = None
     jd_source_url: Optional[str] = None
@@ -26,6 +35,8 @@ class Roadmap(SQLModel, table=True):
     modules: List["Module"] = Relationship(back_populates="roadmap")
     logs: List["AgentLog"] = Relationship(back_populates="roadmap")
     progress: List["ModuleProgress"] = Relationship(back_populates="roadmap")
+
+    # Add the reverse relationship to User so back_populates matches
     user: Optional[User] = Relationship(back_populates="roadmaps")
 
 class Module(SQLModel, table=True):
